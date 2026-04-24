@@ -188,8 +188,9 @@ impl CliCommand for DevCommand {
 
         // Add otel plugin
         if dev_config.wasi_otel {
-            host_builder =
-                host_builder.with_plugin(Arc::new(plugin::wasi_otel::WasiOtel::default()))?;
+            host_builder = host_builder
+                .with_plugin(Arc::new(plugin::wasi_otel_old::WasiOtel::default()))?
+                .with_plugin(Arc::new(plugin::wasi_otel::WasiOtel::default()))?;
             debug!("WASI OpenTelemetry plugin registered");
         }
 

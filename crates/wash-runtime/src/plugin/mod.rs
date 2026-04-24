@@ -48,6 +48,9 @@ pub mod wasi_logging;
 pub mod wasmcloud_postgres;
 
 #[cfg(feature = "wasi-otel")]
+pub mod wasi_otel_old;
+
+#[cfg(feature = "wasi-otel")]
 pub mod wasi_otel;
 
 pub mod wasmcloud_messaging;
