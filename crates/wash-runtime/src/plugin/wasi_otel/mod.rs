@@ -16,7 +16,7 @@ use crate::engine::workload::WorkloadItem;
 use crate::plugin::{HostPlugin, WorkloadTracker};
 use crate::wit::{WitInterface, WitWorld};
 
-use bindings::wasi::otel0_3_0 as wasi_otel;
+use bindings::wasi::otel0_2_0_rc_3 as wasi_otel;
 
 pub const WASI_OTEL_ID: &str = "wasi-otel";
 
@@ -40,7 +40,7 @@ impl HostPlugin for WasiOtel {
     }
 
     fn world(&self) -> WitWorld {
-        let interface = WitInterface::from("wasi:otel/types,tracing@0.3.0");
+        let interface = WitInterface::from("wasi:otel/types,tracing@0.2.0-rc.3");
         let imports = HashSet::from([interface]);
 
         WitWorld {

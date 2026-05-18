@@ -5,7 +5,7 @@ use opentelemetry::trace::{
     SpanContext, SpanId, SpanKind, Status, TraceFlags, TraceId, TraceState,
 };
 
-use super::bindings::wasi::otel0_3_0 as wasi_otel;
+use super::bindings::wasi::otel0_2_0_rc_3 as wasi_otel;
 
 use wasi_otel::tracing::{
     KeyValue as WitKeyValue, SpanContext as WitSpanContext, SpanKind as WitSpanKind,

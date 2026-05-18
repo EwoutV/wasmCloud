@@ -7,7 +7,7 @@ use opentelemetry::{Context, InstrumentationScope, KeyValue, SpanId, TraceFlags,
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use super::bindings::wasi::otel0_3_0::tracing as wasi_tracing;
+use super::bindings::wasi::otel0_2_0_rc_3::tracing as wasi_tracing;
 use super::convert::{
     to_native_systime, to_otel_attributes, to_otel_span_context, to_otel_span_kind, to_otel_status,
     to_wit_span_context,
@@ -138,23 +138,7 @@ impl<'a> wasi_tracing::Host for ActiveCtx<'a> {
         Ok(())
     }
 
-    async fn outer_span_context(&mut self) -> wasmtime::Result<wasi_tracing::SpanContext> {
-        let sc = opentelemetry::Context::current()
-            .span()
-            .span_context()
-            .clone();
-
-        info!(
-            trace_id = %sc.trace_id(),
-            span_id = %sc.span_id(),
-            is_valid = sc.is_valid(),
-            "outer_span_context"
-        );
-
-        Ok(to_wit_span_context(&sc))
-    }
-
-    async fn inner_span_context(&mut self) -> wasmtime::Result<wasi_tracing::SpanContext> {
+    async fn current_span_context(&mut self) -> wasmtime::Result<wasi_tracing::SpanContext> {
         let component_id = Arc::clone(&self.ctx.component_id);
         let plugin = self.ctx.get_plugin::<WasiOtel>(WASI_OTEL_ID);
 
@@ -169,7 +153,7 @@ impl<'a> wasi_tracing::Host for ActiveCtx<'a> {
                         span_id = %sc.span_id(),
                         stack_depth = comp_ctx.span_stack.len(),
                         source = "guest",
-                        "inner_span_context"
+                        "current_span_context"
                     );
                     return Ok(to_wit_span_context(sc));
                 }
@@ -188,7 +172,7 @@ impl<'a> wasi_tracing::Host for ActiveCtx<'a> {
             span_id = %sc.span_id(),
             is_valid = sc.is_valid(),
             source = "host_fallback",
-            "inner_span_context"
+            "current_span_context"
         );
 
         Ok(to_wit_span_context(&sc))
