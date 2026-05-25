@@ -210,7 +210,7 @@ impl Router for DynamicRouter {
         req: &hyper::Request<hyper::body::Incoming>,
     ) -> anyhow::Result<String> {
         tokio::task::block_in_place(move || {
-            let lock = self.host_to_workload.try_read()?;
+            let lock = self.host_to_workload.blocking_read();
             let workload_host = req
                 .headers()
                 .get(hyper::header::HOST)
@@ -274,11 +274,13 @@ impl Router for DevRouter {
         &self,
         _req: &hyper::Request<hyper::body::Incoming>,
     ) -> anyhow::Result<String> {
-        let lock = self.last_workload_id.try_lock()?;
-        match &*lock {
-            Some(id) => Ok(id.clone()),
-            None => anyhow::bail!("no workload available to route request"),
-        }
+        tokio::task::block_in_place(move || {
+            let lock = self.last_workload_id.blocking_lock();
+            match &*lock {
+                Some(id) => Ok(id.clone()),
+                None => anyhow::bail!("no workload available to route request"),
+            }
+        })
     }
 }
 
@@ -842,19 +844,28 @@ pub async fn handle_component_request(
 
         // Otherwise the `sender` will get dropped along with the `Store`
         // meaning that the oneshot will get disconnected
-        Err(e) => {
-            if let Err(task_error) = task.await {
-                error!(err = ?task_error, "error receiving http response");
-                Err(anyhow::anyhow!(
-                    "error receiving http response: {task_error}"
-                ))
-            } else {
+        Err(e) => match task.await {
+            Ok(Ok(())) => {
                 error!(err = ?e, "error receiving http response");
                 Err(anyhow::anyhow!(
                     "oneshot channel closed but no response was sent"
                 ))
             }
-        }
+            Ok(Err(component_error)) => {
+                error!(
+                    err = ?component_error,
+                    detail = %format!("{component_error:#}"),
+                    "component request task failed before sending http response"
+                );
+                Err(component_error.context("component request task failed before sending http response"))
+            }
+            Err(task_error) => {
+                error!(err = ?task_error, "error receiving http response");
+                Err(anyhow::anyhow!(
+                    "error receiving http response: {task_error}"
+                ))
+            }
+        },
     }
 }
 

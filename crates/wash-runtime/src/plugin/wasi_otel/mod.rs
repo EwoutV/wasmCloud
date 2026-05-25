@@ -8,29 +8,30 @@ use anyhow::{self, bail};
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::{SdkTracerProvider, TracerProviderBuilder};
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashMap, collections::HashSet, sync::Arc};
 use tokio::sync::RwLock;
 
 use crate::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use crate::engine::workload::WorkloadItem;
-use crate::plugin::{HostPlugin, WorkloadTracker};
+use crate::plugin::HostPlugin;
 use crate::wit::{WitInterface, WitWorld};
 
 use bindings::wasi::otel0_2_0_rc_3 as wasi_otel;
 
 pub const WASI_OTEL_ID: &str = "wasi-otel";
 
-/// Per-component tracing state.
+/// Per-invocation tracing state keyed by store ID.
 pub struct ComponentContext {
-    pub(super) component_name: String,
-    pub(super) span_stack: Vec<opentelemetry::trace::SpanContext>,
-    pub(super) active_trace_id: Option<opentelemetry::TraceId>,
+    component_name: String,
+    workload_id: String,
+    span_stack: Vec<opentelemetry::trace::SpanContext>,
+    active_trace_id: Option<opentelemetry::TraceId>,
 }
 
 #[derive(Default)]
 pub struct WasiOtel {
     pub provider: Arc<RwLock<Option<SdkTracerProvider>>>,
-    pub tracker: Arc<RwLock<WorkloadTracker<(), ComponentContext>>>,
+    pub invocations: Arc<RwLock<HashMap<String, ComponentContext>>>,
 }
 
 #[async_trait::async_trait]
@@ -89,22 +90,9 @@ impl HostPlugin for WasiOtel {
             bail!("Service can not be tracked");
         };
 
-        // Each component gets a unique instrumentation scope name (its component name).
-        // Identity is expressed through span attributes; all components share one provider
-        // and therefore one gRPC connection to the collector.
-        let component_name = comp_handle.name().to_string();
-
-        let ctx = ComponentContext {
-            component_name: component_name.clone(),
-            span_stack: Vec::new(),
-            active_trace_id: None,
-        };
-
-        self.tracker.write().await.add_component(comp_handle, ctx);
-
         info!(
             component_id = comp_handle.id(),
-            component_name = %component_name,
+            component_name = %comp_handle.name(),
             "WASI OTel tracing interfaces bound to workload item"
         );
 
@@ -116,11 +104,10 @@ impl HostPlugin for WasiOtel {
         workload_id: &str,
         _: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
-        self.tracker
+        self.invocations
             .write()
             .await
-            .remove_workload(workload_id)
-            .await;
+            .retain(|_, state| state.workload_id != workload_id);
 
         info!(workload_id, "WASI OTel tracing unbound from workload");
 

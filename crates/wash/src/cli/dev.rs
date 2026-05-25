@@ -61,6 +61,7 @@ impl CliCommand for DevCommand {
         #[allow(unused_mut)]
         let mut engine_builder = Engine::builder()
             .with_pooling_allocator(true)
+            .with_max_instances(10_000)
             .with_fuel_consumption(ctx.enable_meters());
         #[cfg(feature = "wasip3")]
         {
