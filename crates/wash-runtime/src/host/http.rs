@@ -99,7 +99,7 @@ pub trait Router: Send + Sync + 'static {
     ) -> anyhow::Result<()>;
 
     /// Pick a workload ID based on the incoming request
-    fn route_incoming_request(
+    async fn route_incoming_request(
         &self,
         req: &hyper::Request<hyper::body::Incoming>,
     ) -> anyhow::Result<String>;
@@ -205,29 +205,28 @@ impl Router for DynamicRouter {
     }
 
     /// Pick a workload ID based on the incoming request
-    fn route_incoming_request(
+    async fn route_incoming_request(
         &self,
         req: &hyper::Request<hyper::body::Incoming>,
     ) -> anyhow::Result<String> {
-        tokio::task::block_in_place(move || {
-            let lock = self.host_to_workload.blocking_read();
-            let workload_host = req
-                .headers()
-                .get(hyper::header::HOST)
-                .and_then(|h| h.to_str().ok())
-                .or_else(|| req.uri().authority().map(|a| a.as_str()))
-                .context("no Host header or :authority in request")?;
-            let Some(workload_set) = lock.get(workload_host) else {
-                anyhow::bail!("no workload bound to host header: {}", workload_host);
-            };
+        // Use async RwLock read to avoid blocking the Tokio runtime.
+        let lock = self.host_to_workload.read().await;
+        let workload_host = req
+            .headers()
+            .get(hyper::header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .or_else(|| req.uri().authority().map(|a| a.as_str()))
+            .context("no Host header or :authority in request")?;
+        let Some(workload_set) = lock.get(workload_host) else {
+            anyhow::bail!("no workload bound to host header: {}", workload_host);
+        };
 
-            let workload_id = workload_set
-                .iter()
-                .next()
-                .context("no workload IDs found for host header")?;
+        let workload_id = workload_set
+            .iter()
+            .next()
+            .context("no workload IDs found for host header")?;
 
-            Ok(workload_id.clone())
-        })
+        Ok(workload_id.clone())
     }
 }
 
@@ -270,17 +269,15 @@ impl Router for DevRouter {
     }
 
     /// Pick a workload ID based on the incoming request
-    fn route_incoming_request(
+    async fn route_incoming_request(
         &self,
         _req: &hyper::Request<hyper::body::Incoming>,
     ) -> anyhow::Result<String> {
-        tokio::task::block_in_place(move || {
-            let lock = self.last_workload_id.blocking_lock();
-            match &*lock {
-                Some(id) => Ok(id.clone()),
-                None => anyhow::bail!("no workload available to route request"),
-            }
-        })
+        let lock = self.last_workload_id.lock().await;
+        match &*lock {
+            Some(id) => Ok(id.clone()),
+            None => anyhow::bail!("no workload available to route request"),
+        }
     }
 }
 
@@ -687,10 +684,23 @@ async fn handle_http_request<T: Router>(
     workload_handles: WorkloadHandles,
     fuel_meter: FuelConsumptionMeter,
 ) -> Result<hyper::Response<HyperOutgoingBody>, hyper::Error> {
+    // Fast-path for benchmarking: when `WASH_BENCH_STATIC=1` is set in the
+    // environment, bypass WASM/component invocation and return a static 200
+    // response. This helps isolate whether the WASM path is the bottleneck.
+    if std::env::var("WASH_BENCH_STATIC")
+        .as_deref()
+        .map(|s| s == "1")
+        .unwrap_or(false)
+    {
+        return Ok(hyper::Response::builder()
+            .status(200)
+            .body(HyperOutgoingBody::default())
+            .expect("valid response"));
+    }
     let method = req.method().clone();
     let uri = req.uri().clone();
 
-    let Ok(workload_id) = handler.route_incoming_request(&req) else {
+    let Ok(workload_id) = handler.route_incoming_request(&req).await else {
         return Ok(error_response(400));
     };
 
@@ -857,7 +867,8 @@ pub async fn handle_component_request(
                     detail = %format!("{component_error:#}"),
                     "component request task failed before sending http response"
                 );
-                Err(component_error.context("component request task failed before sending http response"))
+                Err(component_error
+                    .context("component request task failed before sending http response"))
             }
             Err(task_error) => {
                 error!(err = ?task_error, "error receiving http response");

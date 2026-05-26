@@ -59,6 +59,7 @@ wasm-pkg-client = { workspace = true }
 wasm-pkg-core = { workspace = true }
 wash-runtime = { workspace = true, features = ["washlet", "oci", "wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "wasi-otel"] }
 wit-component = { workspace = true }
+dashmap = "6.2.1"
 
 # Enable WebGPU support on non-Windows platforms
 # WebGPU is disabled on Windows due to dependency version conflicts with the windows crate

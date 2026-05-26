@@ -5,11 +5,11 @@ mod tracing;
 use ::tracing::{info, warn};
 
 use anyhow::{self, bail};
+use dashmap::DashMap;
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
 use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::trace::{SdkTracerProvider, TracerProviderBuilder};
-use std::{collections::HashMap, collections::HashSet, sync::Arc};
-use tokio::sync::RwLock;
+use opentelemetry_sdk::trace::{SdkTracerProvider, Tracer as SdkTracer, TracerProviderBuilder};
+use std::{collections::HashSet, sync::Arc, sync::OnceLock};
 
 use crate::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use crate::engine::workload::WorkloadItem;
@@ -20,7 +20,7 @@ use bindings::wasi::otel0_2_0_rc_3 as wasi_otel;
 
 pub const WASI_OTEL_ID: &str = "wasi-otel";
 
-/// Per-invocation tracing state keyed by store ID.
+/// Per-invocation tracing state
 pub struct ComponentContext {
     component_name: String,
     workload_id: String,
@@ -28,10 +28,15 @@ pub struct ComponentContext {
     active_trace_id: Option<opentelemetry::TraceId>,
 }
 
+/// Per-invocation tracing state keyed by store ID.
 #[derive(Default)]
 pub struct WasiOtel {
-    pub provider: Arc<RwLock<Option<SdkTracerProvider>>>,
-    pub invocations: Arc<RwLock<HashMap<String, ComponentContext>>>,
+    // Wait-free access after initialization
+    pub provider: Arc<OnceLock<SdkTracerProvider>>,
+    // Concurrent map for invocations without global blocking
+    pub invocations: Arc<DashMap<String, ComponentContext>>,
+    // Cache tracers to avoid re-creating scopes continuously
+    pub tracers: Arc<DashMap<String, SdkTracer>>,
 }
 
 #[async_trait::async_trait]
@@ -69,7 +74,7 @@ impl HostPlugin for WasiOtel {
             .with_resource(resource)
             .build();
 
-        *self.provider.write().await = Some(provider);
+        let _ = self.provider.set(provider);
 
         Ok(())
     }
@@ -105,8 +110,6 @@ impl HostPlugin for WasiOtel {
         _: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
         self.invocations
-            .write()
-            .await
             .retain(|_, state| state.workload_id != workload_id);
 
         info!(workload_id, "WASI OTel tracing unbound from workload");
@@ -115,7 +118,7 @@ impl HostPlugin for WasiOtel {
     }
 
     async fn stop(&self) -> anyhow::Result<()> {
-        if let Some(provider) = self.provider.write().await.take() {
+        if let Some(provider) = self.provider.get() {
             if let Err(e) = provider.force_flush() {
                 warn!("Failed to flush trace data during shutdown: {e}");
             }
