@@ -3,6 +3,7 @@ mod convert;
 mod tracing;
 
 use ::tracing::{info, warn};
+use opentelemetry::trace::SpanContext;
 
 use anyhow::{self, bail};
 use dashmap::DashMap;
@@ -24,8 +25,18 @@ pub const WASI_OTEL_ID: &str = "wasi-otel";
 pub struct ComponentContext {
     component_name: String,
     workload_id: String,
-    span_stack: Vec<opentelemetry::trace::SpanContext>,
-    active_trace_id: Option<opentelemetry::TraceId>,
+    span_stack: Vec<SpanContext>,
+}
+
+impl ComponentContext {
+    /// Create a new component context with the host's trace ID or a newly generated
+    fn new(component_name: String, workload_id: String) -> Self {
+        Self {
+            component_name,
+            workload_id,
+            span_stack: Vec::new(),
+        }
+    }
 }
 
 /// Per-invocation tracing state keyed by store ID.

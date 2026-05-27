@@ -1,8 +1,7 @@
-use std::convert::TryFrom;
-use std::fmt::{self, Display, Formatter};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use opentelemetry::KeyValue;
+use opentelemetry::trace::TraceContextExt;
 use opentelemetry::trace::{
     SpanContext, SpanId, SpanKind, Status, TraceFlags, TraceId, TraceState,
 };
@@ -15,23 +14,6 @@ use wasi_otel::tracing::{
     KeyValue as WitKeyValue, SpanContext as WitSpanContext, SpanKind as WitSpanKind,
     Status as WitStatus, TraceFlags as WitTraceFlags,
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SpanContextConversionError {
-    InvalidTraceId,
-    InvalidSpanId,
-}
-
-impl std::error::Error for SpanContextConversionError {}
-
-impl Display for SpanContextConversionError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            SpanContextConversionError::InvalidTraceId => f.write_str("invalid trace id"),
-            SpanContextConversionError::InvalidSpanId => f.write_str("invalid span id"),
-        }
-    }
-}
 
 impl From<&SpanContext> for WitSpanContext {
     fn from(ctx: &SpanContext) -> Self {
@@ -49,14 +31,27 @@ impl From<&SpanContext> for WitSpanContext {
     }
 }
 
-impl TryFrom<&WitSpanContext> for SpanContext {
-    type Error = SpanContextConversionError;
-
-    fn try_from(ctx: &WitSpanContext) -> Result<Self, Self::Error> {
+impl From<&WitSpanContext> for SpanContext {
+    fn from(ctx: &WitSpanContext) -> Self {
+        // Convert trace ID or take the outer trace ID. If none, generate one.
         let trace_id = TraceId::from_hex(&ctx.trace_id)
-            .map_err(|_| SpanContextConversionError::InvalidTraceId)?;
-        let span_id = SpanId::from_hex(&ctx.span_id)
-            .map_err(|_| SpanContextConversionError::InvalidSpanId)?;
+            .ok()
+            .filter(|trace_id| *trace_id != TraceId::INVALID)
+            .unwrap_or_else(|| {
+                let host_trace_id = opentelemetry::Context::current()
+                    .span()
+                    .span_context()
+                    .trace_id();
+
+                if host_trace_id == TraceId::INVALID {
+                    TraceId::from(rand::random::<u128>())
+                } else {
+                    host_trace_id
+                }
+            });
+
+        // Convert span ID or generate one.
+            let span_id = SpanId::from_hex(&ctx.span_id).unwrap_or(SpanId::INVALID);
 
         let trace_flags = if ctx.trace_flags.contains(WitTraceFlags::SAMPLED) {
             TraceFlags::SAMPLED
@@ -71,13 +66,7 @@ impl TryFrom<&WitSpanContext> for SpanContext {
         )
         .unwrap_or_default();
 
-        Ok(SpanContext::new(
-            trace_id,
-            span_id,
-            trace_flags,
-            ctx.is_remote,
-            trace_state,
-        ))
+        SpanContext::new(trace_id, span_id, trace_flags, ctx.is_remote, trace_state)
     }
 }
 

@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use opentelemetry::trace::{
-    Span as _, SpanContext as OtelSpanContext, TraceContextExt, TraceState, Tracer, TracerProvider,
+    Span as _, SpanContext as OtelSpanContext, TraceContextExt, TraceFlags, TraceState, Tracer,
+    TracerProvider,
 };
-use opentelemetry::{Context, InstrumentationScope, KeyValue, SpanId, TraceFlags, TraceId};
+use opentelemetry::{Context, InstrumentationScope, KeyValue, SpanId, TraceId};
 use tracing::{debug, warn};
 
 use super::bindings::wasi::otel0_2_0_rc_3::tracing as wasi_tracing;
@@ -23,41 +24,20 @@ impl<'a> wasi_tracing::Host for ActiveCtx<'a> {
             "guest span started"
         );
 
-        let otel_ctx = OtelSpanContext::try_from(&span_context).unwrap_or_else(|_| {
-            OtelSpanContext::new(
-                TraceId::INVALID,
-                SpanId::INVALID,
-                TraceFlags::default(),
-                span_context.is_remote,
-                TraceState::default(),
-            )
-        });
-
         let Some(plugin) = self.ctx.get_plugin::<WasiOtel>(WASI_OTEL_ID) else {
             return Ok(());
         };
 
         let invocation_id = self.ctx.id.clone();
 
-        let mut state =
-            plugin
-                .invocations
-                .entry(invocation_id)
-                .or_insert_with(|| ComponentContext {
-                    component_name: component_id.to_string(),
-                    workload_id: self.ctx.workload_id.as_ref().to_string(),
-                    span_stack: Vec::new(),
-                    active_trace_id: None,
-                });
+        let mut state = plugin.invocations.entry(invocation_id).or_insert_with(|| {
+            ComponentContext::new(
+                component_id.to_string(),
+                self.ctx.workload_id.as_ref().to_string(),
+            )
+        });
 
-        if state.span_stack.is_empty() {
-            let host_trace_id = Context::current().span().span_context().trace_id();
-            state.active_trace_id = Some(if host_trace_id != TraceId::INVALID {
-                host_trace_id
-            } else {
-                TraceId::from(uuid::Uuid::new_v4().as_u128())
-            });
-        }
+        let otel_ctx = OtelSpanContext::from(&span_context);
 
         state.span_stack.push(otel_ctx);
 
@@ -72,46 +52,50 @@ impl<'a> wasi_tracing::Host for ActiveCtx<'a> {
             return Ok(());
         };
 
-        let (component_name, trace_id) = {
-            // Scope the mutable borrow to the DashMap reference
+        let (component_name, trace_id, should_remove) = {
             let Some(mut state) = plugin.invocations.get_mut(&invocation_id) else {
                 warn!(component_id = %component_id, "on_end: invocation not found");
                 return Ok(());
             };
 
-            state.span_stack.pop();
-            let trace_id = state
-                .active_trace_id
-                .unwrap_or_else(|| TraceId::from(uuid::Uuid::new_v4().as_u128()));
+            let Ok(span_id) = SpanId::from_hex(&span_data.span_context.span_id) else {
+                warn!(component_id = %component_id, "on_end: invalid span id");
+                return Ok(());
+            };
+
+            let Some(index) = state
+                .span_stack
+                .iter()
+                .rposition(|span_context| span_context.span_id() == span_id)
+            else {
+                warn!(component_id = %component_id, %span_id, "on_end: span not found in stack");
+                return Ok(());
+            };
+
+            let span_context = state.span_stack.remove(index);
+
+            let trace_id = span_context.trace_id();
+
             let component_name = state.component_name.clone();
+            let should_remove = state.span_stack.is_empty();
 
-            if !state.span_stack.is_empty() {
-                state.active_trace_id = Some(trace_id);
-            }
-
-            (component_name, trace_id)
+            (component_name, trace_id, should_remove)
         };
-
-        // Remove if empty (outside the mutable ref to avoid deadlocks)
-        let should_remove = plugin
-            .invocations
-            .get(&invocation_id)
-            .map(|s| s.span_stack.is_empty())
-            .unwrap_or(false);
 
         if should_remove {
             plugin.invocations.remove(&invocation_id);
         }
+
+        let Some(provider) = plugin.provider.get() else {
+            warn!(component_id = %component_id, "on_end: tracer provider not initialized");
+            return Ok(());
+        };
 
         // Retrieve or create the Tracer cache
         let tracer = plugin
             .tracers
             .entry(component_name.clone())
             .or_insert_with(|| {
-                let provider = plugin
-                    .provider
-                    .get()
-                    .expect("Provider should be initialized");
                 let scope = InstrumentationScope::builder(component_name.clone())
                     .with_attributes([
                         KeyValue::new("service.name", component_name.clone()),
@@ -135,8 +119,11 @@ impl<'a> wasi_tracing::Host for ActiveCtx<'a> {
             builder = builder.with_span_id(span_id);
         }
 
-        let mut span =
-            tracer.build_with_context(builder, &parent_context_for(&span_data, trace_id));
+        let mut span = if let Some(parent_context) = parent_context_for(&span_data, trace_id) {
+            tracer.build_with_context(builder, &parent_context)
+        } else {
+            tracer.build(builder)
+        };
 
         for event in &span_data.events {
             span.add_event(event.name.clone(), to_otel_attributes(&event.attributes));
@@ -153,18 +140,20 @@ impl<'a> wasi_tracing::Host for ActiveCtx<'a> {
     async fn current_span_context(&mut self) -> wasmtime::Result<wasi_tracing::SpanContext> {
         let component_id = Arc::clone(&self.ctx.component_id);
 
-        let (sc, source, stack_depth) = 'resolve: {
+        let sc = 'resolve: {
+            let host_span_ctx = Context::current().span().span_context().clone();
+
             let Some(plugin) = self.ctx.get_plugin::<WasiOtel>(WASI_OTEL_ID) else {
-                break 'resolve (host_span_context(), "host_fallback", 0);
+                break 'resolve host_span_ctx;
             };
 
             let Some(state) = plugin.invocations.get(&self.ctx.id) else {
-                break 'resolve (host_span_context(), "host_fallback", 0);
+                break 'resolve host_span_ctx;
             };
 
             match state.span_stack.last().cloned() {
-                Some(sc) => (sc, "guest", state.span_stack.len()),
-                None => (host_span_context(), "host_fallback", 0),
+                Some(sc) => sc,
+                None => host_span_ctx,
             }
         };
 
@@ -172,8 +161,6 @@ impl<'a> wasi_tracing::Host for ActiveCtx<'a> {
             component_id = %component_id,
             trace_id = %sc.trace_id(),
             span_id = %sc.span_id(),
-            stack_depth,
-            source,
             "current_span_context"
         );
 
@@ -181,15 +168,13 @@ impl<'a> wasi_tracing::Host for ActiveCtx<'a> {
     }
 }
 
-fn host_span_context() -> OtelSpanContext {
-    opentelemetry::Context::current()
-        .span()
-        .span_context()
-        .clone()
-}
-
-fn parent_context_for(span_data: &wasi_tracing::SpanData, trace_id: TraceId) -> Context {
+fn parent_context_for(span_data: &wasi_tracing::SpanData, trace_id: TraceId) -> Option<Context> {
     let parent_span_id = SpanId::from_hex(&span_data.parent_span_id).unwrap_or(SpanId::INVALID);
+
+    if parent_span_id == SpanId::INVALID {
+        return None;
+    }
+
     let parent_sc = OtelSpanContext::new(
         trace_id,
         parent_span_id,
@@ -197,5 +182,6 @@ fn parent_context_for(span_data: &wasi_tracing::SpanData, trace_id: TraceId) -> 
         true,
         TraceState::default(),
     );
-    Context::current().with_remote_span_context(parent_sc)
+
+    Some(Context::current().with_remote_span_context(parent_sc))
 }
